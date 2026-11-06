@@ -1,0 +1,29 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# Hook pre-push · oravalidator (Matriz Oracle de 200 reglas)
+# Analiza los archivos Oracle de los commits que se van a subir y BLOQUEA el
+# push si el quality gate falla. Instalado por instalar_hook.py.
+# ---------------------------------------------------------------------------
+ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$ROOT/.oravalidator/scripts/analizar_branch.py"
+
+if [ ! -f "$SCRIPT" ]; then
+  echo "[oravalidator] No se encontró $SCRIPT. Ejecute de nuevo instalar_hook.py. Push bloqueado." >&2
+  exit 1
+fi
+
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" 2>/dev/null; then
+    PY="$c"; break
+  fi
+done
+if [ -z "$PY" ] && command -v py >/dev/null 2>&1; then PY="py -3"; fi
+if [ -z "$PY" ]; then
+  echo "[oravalidator] Se requiere Python 3.8+ para validar el código Oracle. Push bloqueado." >&2
+  exit 1
+fi
+
+# git entrega las referencias a subir por stdin; se reenvían al analizador.
+# Código 0 = aprobado, 1 = quality gate rechazado, 2 = error (también bloquea).
+exec $PY "$SCRIPT" --pre-push --remoto "$1"

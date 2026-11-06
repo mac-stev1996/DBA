@@ -1,0 +1,6 @@
+projectKey=DBA
+serverUrl=http://localhost:9002
+serverVersion=26.8.0.126808
+dashboardUrl=http://localhost:9002/dashboard?id=DBA
+ceTaskId=262c3f07-d5e1-46fb-bd49-7c27271fd3c8
+ceTaskUrl=http://localhost:9002/api/ce/task?id=262c3f07-d5e1-46fb-bd49-7c27271fd3c8

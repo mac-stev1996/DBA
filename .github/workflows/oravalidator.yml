@@ -1,0 +1,137 @@
+# ---------------------------------------------------------------------------
+# Quality gate Oracle (oravalidator) — escaneo automático con la Matriz Oracle
+#
+# Se ejecuta solo:
+#   · en cada push a cualquier branch  → analiza lo que cambió respecto a la rama base
+#   · en cada pull request             → analiza lo que cambió y comenta el resultado en el PR
+#   · manualmente (Actions › oravalidator › Run workflow) → cualquier branch, con filtros
+#
+# Usa las reglas y la política de .oravalidator/ (las mismas del dashboard de reglas:
+# sincronícelas desde la pestaña «Sincronización» o pidiéndoselo a Claude).
+# Para BLOQUEAR el merge: Settings › Branches › regla de la rama protegida ›
+# «Require status checks to pass» › marque «oravalidator».
+# ---------------------------------------------------------------------------
+name: oravalidator
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: "Branch a escanear (vacío = el elegido en «Use workflow from»)"
+        required: false
+        default: ""
+      base:
+        description: "Rama base (vacío = analizar el branch completo)"
+        required: false
+        default: ""
+      categorias:
+        description: "Casos de prueba: categorías separadas por coma (vacío = todas). Ej: Seguridad,DML"
+        required: false
+        default: ""
+      severidad_minima:
+        description: "Aplicar solo reglas de esta severidad o superior"
+        type: choice
+        options: [TODAS, BLOCKER, CRITICAL, MAJOR, MINOR]
+        default: TODAS
+
+permissions:
+  contents: read
+  pull-requests: write   # solo para comentar el resultado en el PR
+
+concurrency:
+  group: oravalidator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oravalidator:
+    name: oravalidator
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Escanear código Oracle
+        id: scan
+        env:
+          EVENTO: ${{ github.event_name }}
+          RAMA_IN: ${{ inputs.rama }}
+          BASE_IN: ${{ inputs.base }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ANTES: ${{ github.event.before }}
+          ORAV_CATEGORIAS: ${{ inputs.categorias }}
+          ORAV_SEVERIDAD_MINIMA: ${{ inputs.severidad_minima }}
+        run: |
+          set +e
+          case "$EVENTO" in
+            pull_request)       RAMA="$HEAD_REF"; BASE="$BASE_REF"; MODO=diff ;;
+            workflow_dispatch)  RAMA="${RAMA_IN:-$REF_NAME}"; BASE="$BASE_IN"; MODO=$([ -n "$BASE" ] && echo diff || echo completo) ;;
+            *)                  RAMA="$REF_NAME"
+                                if [ "$RAMA" = "$DEFAULT_BRANCH" ]; then
+                                  # push a la rama principal: solo lo que llegó en este push
+                                  if [ -n "$ANTES" ] && [ "$ANTES" != "0000000000000000000000000000000000000000" ]; then BASE="$ANTES"; MODO=diff; else BASE=""; MODO=completo; fi
+                                else BASE="$DEFAULT_BRANCH"; MODO=diff; fi ;;
+          esac
+          git fetch --quiet origin "+refs/heads/*:refs/remotes/origin/*" || true
+          git rev-parse -q --verify "origin/$RAMA" >/dev/null || git rev-parse -q --verify "$RAMA" >/dev/null || git branch -f "$RAMA" HEAD
+          ARGS=(--repo . --rama "$RAMA" --modo "$MODO" --salida reporte)
+          [ -n "$BASE" ] && ARGS+=(--base "$BASE")
+          echo "Escaneando $RAMA (modo $MODO${BASE:+, base $BASE})"
+          python .oravalidator/scripts/analizar_branch.py "${ARGS[@]}"
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "rama=$RAMA" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Resumen del escaneo
+        if: always()
+        run: |
+          if [ -f reporte/reporte_oravalidator.md ]; then cat reporte/reporte_oravalidator.md >> "$GITHUB_STEP_SUMMARY"
+          else echo "No se generó el reporte: revise el paso «Escanear código Oracle»." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Publicar reporte (HTML, Markdown y JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-oravalidator-${{ github.run_number }}
+          path: reporte/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Comentar el resultado en el pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles('reporte/reporte_oravalidator.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "<!-- oravalidator -->"
+            head -c 60000 reporte/reporte_oravalidator.md
+            echo
+            echo "📎 Reporte completo (HTML): [artefacto de la ejecución]($RUN_URL)"
+          } > comentario.md
+          # Reemplaza el comentario anterior del validador en vez de acumular uno por push
+          ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- oravalidator -->")) | .id' | tail -1)
+          if [ -n "$ID" ]; then gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$ID" -F body=@comentario.md >/dev/null
+          else gh pr comment "$PR" --body-file comentario.md; fi || echo "::warning::No se pudo comentar en el PR (los PR desde forks no tienen permiso de escritura)."
+
+      - name: Quality gate
+        if: always()
+        run: |
+          case "${{ steps.scan.outputs.rc }}" in
+            0) echo "✔ Quality gate APROBADO" ;;
+            1) echo "::error::Quality gate RECHAZADO: corrija las novedades marcadas como «Bloquea» (ver resumen y reporte)."; exit 1 ;;
+            *) echo "::error::El validador no pudo ejecutarse (código ${{ steps.scan.outputs.rc }}). Revise el paso «Escanear código Oracle»."; exit 1 ;;
+          esac
